@@ -1,0 +1,17 @@
+{
+  "name": "obsidian-focus-queue",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Obsidian-Plugin: Tickets/Tasks in eine Reihenfolge bringen und im Fokus-Modus mit Timer abarbeiten.",
+  "scripts": {
+    "build": "tsc --noEmit -p . && esbuild src/main.ts --bundle --format=cjs --platform=browser --target=es2020 --external:obsidian --external:electron --outfile=dist/main.js && cp manifest.json styles.css dist/",
+    "test": "node scripts/test.mjs",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.14.4",
+    "typescript": "^7.0.2"
+  }
+}

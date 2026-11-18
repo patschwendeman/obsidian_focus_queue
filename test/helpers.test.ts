@@ -1,0 +1,17 @@
+import { setFmField, appendVerlauf, linkText, formatDuration } from "../src/main";
+import * as fs from "fs";
+let fail = 0; const ok = (c: boolean, m: string) => { if (!c) { fail++; console.log("FAIL", m); } };
+const tpl = "---\ntyp: ticket\nstatus: offen   # offen | in Arbeit | wartet | erledigt\nprio: mittel\n---\n# X\n\n## Verlauf\n- 2026-11-16: angelegt\n";
+const a = setFmField(tpl, "status", "erledigt");
+ok(a.includes("status: erledigt   # offen | in Arbeit"), "keeps comment: " + a);
+const b = appendVerlauf(a, "2026-11-17: im Fokus-Modus erledigt · ⏱ 25m");
+ok(b.endsWith("- 2026-11-16: angelegt\n- 2026-11-17: im Fokus-Modus erledigt · ⏱ 25m\n"), "verlauf: " + JSON.stringify(b));
+const real = fs.readFileSync(process.cwd() + "/test/fixtures/ticket.md", "utf8");
+const r = appendVerlauf(setFmField(real, "status", "erledigt"), "TEST");
+ok(/^status: erledigt$/m.test(r) && r.split("\n").filter(l => l.startsWith("status:")).length === 1, "real fm");
+const vi = r.split("\n"); const vs = vi.indexOf("## Verlauf"); ok(vi.slice(vs).includes("- TEST"), "real verlauf");
+ok(setFmField("---\na: 1\n---\nx", "status", "in Arbeit") === "---\na: 1\nstatus: in Arbeit\n---\nx", "insert");
+ok(appendVerlauf("# t\n\n## Verlauf\n- a\n\n## Danach\nz", "b").includes("- a\n- b\n\n## Danach"), "mid section");
+ok(linkText('[[M-Exchange]]') === "M-Exchange" && linkText(["[[A|B]]", "[[C]]"]) === "B, C", "links");
+ok(formatDuration(90*60000) === "1h 30m", "dur");
+console.log(fail ? fail + " FEHLER" : "Alle Checks OK");
