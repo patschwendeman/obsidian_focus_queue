@@ -389,3 +389,57 @@
 	font-size: var(--font-ui-small);
 	padding: 2px 12px;
 }
+
+/* ---------- Subtasks gruppiert nach Ticket ---------- */
+.fq-ticket-group {
+	margin-bottom: var(--size-4-3);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	overflow: hidden;
+}
+.fq-ticket-head {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--size-4-2);
+	padding: var(--size-4-2);
+	background: var(--background-secondary);
+	font-size: var(--font-ui-small);
+}
+.fq-ticket-head .fq-body {
+	flex: 1;
+	min-width: 0;
+}
+.fq-ticket-group .fq-available {
+	padding: 2px 0;
+}
+.fq-subtask {
+	align-items: center;
+	padding-left: var(--size-4-3);
+}
+.fq-subtask-text {
+	font-weight: 500;
+}
+.fq-subtask-text.is-whole-ticket {
+	color: var(--text-muted);
+	font-style: italic;
+	font-weight: normal;
+}
+.fq-chip.is-small {
+	font-size: var(--font-ui-smaller);
+	font-weight: 500;
+	line-height: 1.4;
+	padding: 0 6px;
+}
+.fq-focus-ticket {
+	margin-top: var(--size-4-1);
+	color: var(--text-muted);
+	cursor: pointer;
+	text-align: center;
+}
+.fq-focus-ticket:hover {
+	color: var(--text-accent);
+}
+.fq-progress {
+	color: var(--text-muted);
+	font-variant-numeric: tabular-nums;
+}

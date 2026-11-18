@@ -1,7 +1,7 @@
 {
 	"id": "focus-queue",
 	"name": "Focus Queue",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"minAppVersion": "1.5.0",
 	"description": "Tasks aus dem Vault in eine Reihenfolge bringen und im Fokus-Modus einen nach dem anderen mit Timer abarbeiten.",
 	"author": "Patrick Schwendemann",

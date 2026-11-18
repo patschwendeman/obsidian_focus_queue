@@ -26,6 +26,7 @@ interface Settings {
 	setInProgressOnStart: boolean;
 	autoStartTimer: boolean;
 	focusLocation: "tab" | "sidebar";
+	subtaskHeading: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -40,7 +41,13 @@ const DEFAULT_SETTINGS: Settings = {
 	setInProgressOnStart: true,
 	autoStartTimer: false,
 	focusLocation: "tab",
+	subtaskHeading: "## Subtasks",
 };
+
+export interface Subtask {
+	text: string;
+	done: boolean;
+}
 
 export interface Ticket {
 	path: string;
@@ -53,6 +60,74 @@ export interface Ticket {
 	projekt: string;
 	link: string;
 	faellig: string;
+	/** Checkboxen unter „## Subtasks“ (leer, solange die Notiz noch nicht gelesen ist). */
+	subtasks: Subtask[];
+}
+
+/**
+ * Ein Queue-Eintrag ist entweder ein Subtask („Pfad::Subtask-Text“) oder – für Tickets
+ * ohne offene Subtasks – das ganze Ticket (nur der Pfad).
+ */
+export interface QueueItem {
+	id: string;
+	path: string;
+	sub: string | null;
+}
+
+export const SUB_SEP = "::";
+
+export function itemId(path: string, sub?: string | null): string {
+	return sub ? `${path}${SUB_SEP}${sub}` : path;
+}
+
+export function splitItem(id: string): QueueItem {
+	const i = id.indexOf(SUB_SEP);
+	return i < 0 ? { id, path: id, sub: null } : { id, path: id.slice(0, i), sub: id.slice(i + SUB_SEP.length) };
+}
+
+const TASK_LINE = /^(\s*[-*+]\s+\[)(.)(\]\s?)(.*)$/;
+
+function sectionRange(lines: string[], heading: string): [number, number] {
+	const start = lines.findIndex((l) => l.trim() === heading.trim());
+	if (start < 0) return [-1, -1];
+	const level = (heading.trim().match(/^#+/) ?? ["##"])[0].length;
+	let end = lines.findIndex((l, i) => {
+		if (i <= start) return false;
+		const m = l.match(/^(#+)\s/);
+		return !!m && m[1].length <= level;
+	});
+	if (end < 0) end = lines.length;
+	return [start, end];
+}
+
+/** Liest die Checkboxen unter dem Subtask-Abschnitt. */
+export function parseSubtasks(text: string, heading = DEFAULT_SETTINGS.subtaskHeading): Subtask[] {
+	const lines = text.split("\n");
+	const [s, e] = sectionRange(lines, heading);
+	if (s < 0) return [];
+	const out: Subtask[] = [];
+	for (let i = s + 1; i < e; i++) {
+		const m = lines[i].match(TASK_LINE);
+		if (!m) continue;
+		const t = m[4].trim();
+		if (t) out.push({ text: t, done: m[2] !== " " });
+	}
+	return out;
+}
+
+/** Hakt den ersten offenen Subtask mit diesem Text ab. */
+export function tickSubtask(text: string, sub: string, heading = DEFAULT_SETTINGS.subtaskHeading): string {
+	const lines = text.split("\n");
+	const [s, e] = sectionRange(lines, heading);
+	if (s < 0) return text;
+	for (let i = s + 1; i < e; i++) {
+		const m = lines[i].match(TASK_LINE);
+		if (m && m[2] === " " && m[4].trim() === sub) {
+			lines[i] = `${m[1]}x${m[3]}${m[4]}`;
+			return lines.join("\n");
+		}
+	}
+	return text;
 }
 
 interface TimerState {
@@ -70,13 +145,14 @@ export interface Session {
 	path: string;
 	start: number;
 	end: number;
+	sub?: string;
 }
 
 interface PluginData {
 	pendingLogs: Session[];
 	settings: Settings;
-	queue: string[]; // Pfade der Ticket-Notizen
-	timers: Record<string, TimerState>; // key = Pfad
+	queue: string[]; // Queue-Einträge (siehe QueueItem)
+	timers: Record<string, TimerState>; // key = Queue-Eintrag
 	today: DayStats;
 }
 
@@ -179,6 +255,7 @@ export default class FocusQueuePlugin extends Plugin {
 	data!: PluginData;
 	tickets = new Map<string, Ticket>();
 	statusEl!: HTMLElement;
+	private refreshSeq = 0;
 
 	async onload() {
 		const loaded = (await this.loadData()) ?? {};
@@ -204,25 +281,28 @@ export default class FocusQueuePlugin extends Plugin {
 		this.addCommand({ id: "open-queue", name: "Queue öffnen", callback: () => this.openQueue() });
 		this.addCommand({ id: "start-focus", name: "Fokus-Modus starten", callback: () => this.startFocus() });
 		this.addCommand({ id: "toggle-timer", name: "Timer starten/stoppen", callback: () => this.toggleCurrentTimer() });
-		this.addCommand({ id: "complete-current", name: "Aktuelles Ticket erledigen", callback: () => this.completeCurrent() });
-		this.addCommand({ id: "skip-current", name: "Aktuelles Ticket überspringen (ans Ende)", callback: () => this.skipCurrent() });
+		this.addCommand({ id: "complete-current", name: "Aktuellen Eintrag erledigen", callback: () => this.completeCurrent() });
+		this.addCommand({ id: "skip-current", name: "Aktuellen Eintrag überspringen (ans Ende)", callback: () => this.skipCurrent() });
 		this.addCommand({
 			id: "add-current-ticket",
-			name: "Aktuelle Ticket-Notiz zur Queue hinzufügen",
+			name: "Offene Subtasks der aktuellen Ticket-Notiz zur Queue hinzufügen",
 			checkCallback: (checking) => {
 				const f = this.app.workspace.getActiveFile();
 				const t = f ? this.readTicket(f) : null;
 				if (!t) return false;
-				if (!checking) this.addToQueue(t.path);
+				if (!checking) this.addTicketToQueue(t.path);
 				return true;
 			},
 		});
 
 		this.registerEvent(
 			this.app.workspace.on("file-menu", (menu, file) => {
-				if (!(file instanceof TFile) || !this.readTicket(file) || this.inQueue(file.path)) return;
+				if (!(file instanceof TFile) || !this.readTicket(file)) return;
 				menu.addItem((i) =>
-					i.setTitle("Zur Fokus-Queue hinzufügen").setIcon("list-plus").onClick(() => this.addToQueue(file.path)),
+					i
+						.setTitle("Offene Subtasks zur Fokus-Queue hinzufügen")
+						.setIcon("list-plus")
+						.onClick(() => this.addTicketToQueue(file.path)),
 				);
 			}),
 		);
@@ -231,7 +311,7 @@ export default class FocusQueuePlugin extends Plugin {
 
 		const debounced = debounce(() => this.refresh(), 500, true);
 		this.app.workspace.onLayoutReady(async () => {
-			this.refresh();
+			await this.refresh();
 			this.flushLogs();
 			this.registerEvent(this.app.metadataCache.on("changed", () => debounced()));
 			this.registerEvent(this.app.vault.on("delete", () => debounced()));
@@ -252,24 +332,20 @@ export default class FocusQueuePlugin extends Plugin {
 		this.registerInterval(window.setInterval(() => this.tick(), 1000));
 	}
 
-	/** Alte Version (Queue aus einzelnen Tasks) → Queue aus Ticket-Notizen. */
+	/** Ältere Datenformate übernehmen (v1.0: Objekte mit path). */
 	private migrate(loaded: any) {
 		const q: unknown[] = loaded.queue ?? [];
-		const timers: Record<string, TimerState> = loaded.timers ?? {};
 		for (const item of q) {
-			const path = typeof item === "string" ? item : (item as any)?.path;
-			if (path && !this.data.queue.includes(path)) this.data.queue.push(path);
+			const id = typeof item === "string" ? item : (item as any)?.path;
+			if (id && !this.data.queue.includes(id)) this.data.queue.push(id);
 		}
-		for (const [id, t] of Object.entries(timers)) {
-			const path = id.includes("::") ? id.split("::")[0] : id;
-			const cur = (this.data.timers[path] ??= { elapsed: 0, startedAt: null });
-			cur.elapsed += t.elapsed + (t.startedAt ? Date.now() - t.startedAt : 0);
-		}
+		const timers: Record<string, TimerState> = loaded.timers ?? {};
+		for (const [id, t] of Object.entries(timers)) this.data.timers[id] = { ...t };
 	}
 
 	onunload() {
 		// Laufende Blöcke merken; sie werden beim nächsten Start in die Notizen geschrieben.
-		for (const path of Object.keys(this.data.timers)) this.pauseTimer(path, false);
+		for (const id of Object.keys(this.data.timers)) this.pauseTimer(id, false);
 		this.saveData(this.data);
 	}
 
@@ -281,17 +357,31 @@ export default class FocusQueuePlugin extends Plugin {
 		return this.data.settings;
 	}
 
-	get currentPath(): string | undefined {
+	get currentId(): string | undefined {
 		return this.data.queue[0];
 	}
 
-	get current(): Ticket | undefined {
-		const p = this.currentPath;
-		return p ? this.tickets.get(p) : undefined;
+	/** Alias für ältere Aufrufer/Tests. */
+	get currentPath(): string | undefined {
+		return this.currentId;
 	}
 
 	ticket(path: string): Ticket | undefined {
 		return this.tickets.get(path);
+	}
+
+	item(id: string): QueueItem {
+		return splitItem(id);
+	}
+
+	/** Anzeigename eines Queue-Eintrags: Subtask-Text bzw. Ticketname. */
+	itemTitle(id: string): string {
+		const it = splitItem(id);
+		return it.sub ?? this.ticketName(it.path);
+	}
+
+	ticketName(path: string): string {
+		return this.ticket(path)?.name ?? path.split("/").pop()!.replace(/\.md$/, "");
 	}
 
 	private list(s: string): string[] {
@@ -303,6 +393,10 @@ export default class FocusQueuePlugin extends Plugin {
 
 	isHidden(status: string) {
 		return this.list(this.cfg.hiddenStatuses).map((s) => s.toLowerCase()).includes((status || "").toLowerCase());
+	}
+
+	isDone(t: Ticket) {
+		return t.status.toLowerCase() === this.cfg.doneStatus.toLowerCase();
 	}
 
 	// ---------- Tickets lesen ----------
@@ -324,47 +418,90 @@ export default class FocusQueuePlugin extends Plugin {
 			projekt: linkText(fm.projekt),
 			link: String(fm.link ?? "").trim(),
 			faellig: fm.faellig ? String(fm.faellig) : "",
+			subtasks: this.tickets.get(file.path)?.subtasks ?? [],
 		};
 	}
 
-	refresh() {
-		this.tickets.clear();
+	async refresh() {
+		const seq = ++this.refreshSeq;
+		const next = new Map<string, Ticket>();
 		for (const f of this.app.vault.getMarkdownFiles()) {
 			const t = this.readTicket(f);
-			if (t) this.tickets.set(t.path, t);
+			if (!t) continue;
+			try {
+				t.subtasks = parseSubtasks(await this.app.vault.cachedRead(f), this.cfg.subtaskHeading);
+			} catch {
+				/* Datei gerade nicht lesbar – alten Stand behalten */
+			}
+			next.set(t.path, t);
 		}
-		// Queue bereinigen: gelöschte oder anderweitig erledigte Tickets entfernen
-		const before = this.data.queue.length;
-		this.data.queue = this.data.queue.filter((p) => {
-			const file = this.app.vault.getAbstractFileByPath(p);
-			if (!(file instanceof TFile)) return false;
-			if (!this.app.metadataCache.getFileCache(file)) return true; // noch nicht indiziert
-			const t = this.tickets.get(p);
-			return !!t && t.status.toLowerCase() !== this.cfg.doneStatus.toLowerCase();
-		});
-		this.data.queue = [...new Set(this.data.queue)];
-		if (this.data.queue.length !== before) this.save();
+		if (seq !== this.refreshSeq) return; // ein neuerer Lauf ist schon unterwegs
+		this.tickets = next;
+		if (this.cleanQueue()) await this.save();
 		this.renderViews();
+	}
+
+	/**
+	 * Queue bereinigen: gelöschte/erledigte Tickets und erledigte/verschwundene Subtasks entfernen.
+	 * Ein ganzes Ticket, das inzwischen offene Subtasks hat, wird durch diese ersetzt.
+	 */
+	private cleanQueue(): boolean {
+		const before = JSON.stringify(this.data.queue);
+		const out: string[] = [];
+		const push = (id: string) => {
+			if (!out.includes(id)) out.push(id);
+		};
+		for (const id of this.data.queue) {
+			const { path, sub } = splitItem(id);
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) continue;
+			if (!this.app.metadataCache.getFileCache(file)) {
+				push(id); // noch nicht indiziert
+				continue;
+			}
+			const t = this.tickets.get(path);
+			if (!t || this.isDone(t)) continue;
+			const open = t.subtasks.filter((s) => !s.done);
+			if (sub === null) {
+				if (open.length === 0) push(id);
+				else {
+					this.pauseTimer(id);
+					for (const s of open) push(itemId(path, s.text));
+				}
+				continue;
+			}
+			if (open.some((s) => s.text === sub)) push(id);
+		}
+		this.data.queue = out;
+		return JSON.stringify(out) !== before;
 	}
 
 	private handleRename(newPath: string, oldPath: string) {
 		let changed = false;
-		this.data.queue = this.data.queue.map((p) => {
-			if (p !== oldPath) return p;
-			changed = true;
-			return newPath;
+		const move = (id: string) => {
+			const it = splitItem(id);
+			return it.path === oldPath ? itemId(newPath, it.sub) : id;
+		};
+		this.data.queue = this.data.queue.map((id) => {
+			const n = move(id);
+			if (n !== id) changed = true;
+			return n;
 		});
-		if (this.data.timers[oldPath]) {
-			this.data.timers[newPath] = this.data.timers[oldPath];
-			delete this.data.timers[oldPath];
+		for (const id of Object.keys(this.data.timers)) {
+			const n = move(id);
+			if (n === id) continue;
+			this.data.timers[n] = this.data.timers[id];
+			delete this.data.timers[id];
 			changed = true;
 		}
+		for (const s of this.data.pendingLogs) if (s.path === oldPath) s.path = newPath;
 		if (changed) this.save();
 	}
 
+	/** Offene Tickets für die Auswahl (sortiert nach Prio, Status, Name). */
 	availableTickets(): Ticket[] {
 		return [...this.tickets.values()]
-			.filter((t) => !this.inQueue(t.path) && !this.isHidden(t.status))
+			.filter((t) => !this.isHidden(t.status) && this.availableItems(t).length > 0)
 			.sort(
 				(a, b) =>
 					(PRIO_ORDER[a.prio] ?? 3) - (PRIO_ORDER[b.prio] ?? 3) ||
@@ -373,26 +510,46 @@ export default class FocusQueuePlugin extends Plugin {
 			);
 	}
 
-	// ---------- Queue ----------
-
-	inQueue(path: string) {
-		return this.data.queue.includes(path);
+	/** Auswählbare Einträge eines Tickets: offene Subtasks, sonst das ganze Ticket. */
+	availableItems(t: Ticket): QueueItem[] {
+		const open = t.subtasks.filter((s) => !s.done);
+		const items = open.length ? open.map((s) => splitItem(itemId(t.path, s.text))) : [splitItem(t.path)];
+		return items.filter((it) => !this.inQueue(it.id));
 	}
 
-	async addToQueue(path: string, index?: number) {
-		if (this.inQueue(path)) {
-			new Notice("Ticket ist schon in der Queue");
+	// ---------- Queue ----------
+
+	inQueue(id: string) {
+		return this.data.queue.includes(id);
+	}
+
+	async addToQueue(id: string, index?: number) {
+		if (this.inQueue(id)) {
+			new Notice("Eintrag ist schon in der Queue");
 			return;
 		}
 		const i = index === undefined ? this.data.queue.length : Math.max(0, Math.min(index, this.data.queue.length));
-		this.data.queue.splice(i, 0, path);
+		this.data.queue.splice(i, 0, id);
 		await this.save();
 		this.renderViews();
 	}
 
-	async removeFromQueue(path: string) {
-		this.pauseTimer(path);
-		this.data.queue = this.data.queue.filter((p) => p !== path);
+	/** Alle offenen Subtasks eines Tickets (bzw. das Ticket selbst) ans Ende der Queue. */
+	async addTicketToQueue(path: string) {
+		const t = this.ticket(path);
+		const items = t ? this.availableItems(t) : [];
+		if (!items.length) {
+			new Notice("Alles von diesem Ticket ist schon in der Queue");
+			return;
+		}
+		this.data.queue.push(...items.map((it) => it.id));
+		await this.save();
+		this.renderViews();
+	}
+
+	async removeFromQueue(id: string) {
+		this.pauseTimer(id);
+		this.data.queue = this.data.queue.filter((p) => p !== id);
 		await this.save();
 		this.renderViews();
 	}
@@ -411,31 +568,40 @@ export default class FocusQueuePlugin extends Plugin {
 	}
 
 	async skipCurrent() {
-		const cur = this.currentPath;
+		const cur = this.currentId;
 		if (!cur || this.data.queue.length < 2) return;
 		this.pauseTimer(cur);
 		this.data.queue.push(this.data.queue.shift()!);
-		if (this.cfg.autoStartTimer && this.currentPath) await this.startTimerFor(this.currentPath);
+		if (this.cfg.autoStartTimer && this.currentId) await this.startTimerFor(this.currentId);
 		await this.save();
 		this.renderViews();
 	}
 
 	async completeCurrent() {
-		const path = this.currentPath;
-		if (!path) {
-			new Notice("Keine Tickets in der Queue");
+		const id = this.currentId;
+		if (!id) {
+			new Notice("Keine Einträge in der Queue");
 			return;
 		}
-		this.pauseTimer(path);
+		const { path, sub } = splitItem(id);
+		this.pauseTimer(id);
 		await this.flushLogs();
-		const ms = this.getElapsed(path);
+		const ms = this.getElapsed(id);
+		const time = ms >= 30000 ? ` (⏱ ${formatDuration(ms)})` : "";
 		const file = this.app.vault.getAbstractFileByPath(path);
+		let ticketDone = false;
 		if (file instanceof TFile) {
 			await this.app.vault.process(file, (text) => {
+				if (sub !== null) {
+					let out = tickSubtask(text, sub, this.cfg.subtaskHeading);
+					if (this.cfg.logToVerlauf) out = appendVerlauf(out, `${todayStr()}: Subtask „${sub}“ erledigt${time}`);
+					ticketDone = parseSubtasks(out, this.cfg.subtaskHeading).every((s) => s.done);
+					return out;
+				}
 				let out = setFmField(text, "status", this.cfg.doneStatus);
 				if (this.cfg.logToVerlauf) {
-					const time = ms >= 30000 ? ` (gesamt ⏱ ${formatDuration(ms)})` : "";
-					out = appendVerlauf(out, `${todayStr()}: im Fokus-Modus erledigt${time}`);
+					const total = ms >= 30000 ? ` (gesamt ⏱ ${formatDuration(ms)})` : "";
+					out = appendVerlauf(out, `${todayStr()}: im Fokus-Modus erledigt${total}`);
 				}
 				return out;
 			});
@@ -446,34 +612,41 @@ export default class FocusQueuePlugin extends Plugin {
 		this.data.today.count += 1;
 		this.data.today.ms += ms;
 
-		this.data.queue = this.data.queue.filter((p) => p !== path);
-		delete this.data.timers[path];
-		const next = this.currentPath;
+		this.data.queue = this.data.queue.filter((p) => p !== id);
+		delete this.data.timers[id];
+		const t = this.ticket(path);
+		if (t && sub !== null) {
+			t.subtasks = t.subtasks.map((s) => (s.text === sub && !s.done ? { ...s, done: true } : s));
+		}
+		const next = this.currentId;
 		if (next && this.cfg.autoStartTimer) await this.startTimerFor(next);
 		await this.save();
 		this.renderViews();
-		const nt = next ? this.ticket(next) : undefined;
-		new Notice(nt ? `✓ Erledigt. Weiter mit: ${nt.name}` : "✓ Erledigt – die Queue ist leer 🎉");
+		const nextLabel = next ? this.itemTitle(next) : "";
+		const head = sub !== null && ticketDone ? `✓ Alle Subtasks von ${this.ticketName(path)} erledigt.` : "✓ Erledigt.";
+		new Notice(next ? `${head} Weiter mit: ${nextLabel}` : `${head} Die Queue ist leer 🎉`);
 	}
 
 	// ---------- Timer ----------
 
-	getElapsed(path: string): number {
-		const t = this.data.timers[path];
+	getElapsed(id: string): number {
+		const t = this.data.timers[id];
 		if (!t) return 0;
 		return t.elapsed + (t.startedAt ? Date.now() - t.startedAt : 0);
 	}
 
-	isRunning(path: string): boolean {
-		return !!this.data.timers[path]?.startedAt;
+	isRunning(id: string): boolean {
+		return !!this.data.timers[id]?.startedAt;
 	}
 
 	/** Stoppt den Timer; der Arbeitsblock wird protokolliert (async). */
-	pauseTimer(path: string, flush = true) {
-		const t = this.data.timers[path];
+	pauseTimer(id: string, flush = true) {
+		const t = this.data.timers[id];
 		if (!t?.startedAt) return;
 		const now = Date.now();
-		const session = { path, start: t.startedAt, end: now };
+		const { path, sub } = splitItem(id);
+		const session: Session = { path, start: t.startedAt, end: now };
+		if (sub !== null) session.sub = sub;
 		t.elapsed += now - t.startedAt;
 		t.startedAt = null;
 		if (this.cfg.logBlocks && session.end - session.start >= this.cfg.minBlockMinutes * 60000) {
@@ -513,16 +686,19 @@ export default class FocusQueuePlugin extends Plugin {
 	private async writeSession(s: Session) {
 		const dur = formatDuration(s.end - s.start);
 		const span = `${hhmm(s.start)}–${hhmm(s.end)}`;
+		const what = s.sub ? ` · ${s.sub}` : "";
 		const file = this.app.vault.getAbstractFileByPath(s.path);
 		if (file instanceof TFile) {
-			await this.app.vault.process(file, (text) => appendVerlauf(text, `${dateStr(s.start)} ${span}: ⏱ ${dur} gearbeitet`));
+			await this.app.vault.process(file, (text) =>
+				appendVerlauf(text, `${dateStr(s.start)} ${span}: ⏱ ${dur} gearbeitet${what}`),
+			);
 		}
 		if (this.cfg.logToDaily) {
 			const daily = await this.getDailyNote(s.start);
 			const name = file instanceof TFile ? file.basename : s.path.split("/").pop()!.replace(/\.md$/, "");
 			if (daily) {
 				await this.app.vault.process(daily, (text) =>
-					appendToSection(text, this.cfg.dailySection || "## Zeiterfassung", `${span} [[${name}]] · ⏱ ${dur}`),
+					appendToSection(text, this.cfg.dailySection || "## Zeiterfassung", `${span} [[${name}]]${what} · ⏱ ${dur}`),
 				);
 			}
 		}
@@ -553,11 +729,12 @@ export default class FocusQueuePlugin extends Plugin {
 		return await this.app.vault.create(path, content);
 	}
 
-	/** Startet den Timer und setzt optional status "offen" → "in Arbeit". */
-	async startTimerFor(path: string) {
-		for (const k of Object.keys(this.data.timers)) if (k !== path) this.pauseTimer(k);
-		const t = (this.data.timers[path] ??= { elapsed: 0, startedAt: null });
+	/** Startet den Timer und setzt optional am Ticket status "offen" → "in Arbeit". */
+	async startTimerFor(id: string) {
+		for (const k of Object.keys(this.data.timers)) if (k !== id) this.pauseTimer(k);
+		const t = (this.data.timers[id] ??= { elapsed: 0, startedAt: null });
 		if (!t.startedAt) t.startedAt = Date.now();
+		const path = splitItem(id).path;
 		const tk = this.ticket(path);
 		if (this.cfg.setInProgressOnStart && tk && tk.status.toLowerCase() === "offen") {
 			const file = this.app.vault.getAbstractFileByPath(path);
@@ -566,9 +743,9 @@ export default class FocusQueuePlugin extends Plugin {
 	}
 
 	async toggleCurrentTimer() {
-		const cur = this.currentPath;
+		const cur = this.currentId;
 		if (!cur) {
-			new Notice("Keine Tickets in der Queue");
+			new Notice("Keine Einträge in der Queue");
 			return;
 		}
 		if (this.isRunning(cur)) this.pauseTimer(cur);
@@ -577,8 +754,8 @@ export default class FocusQueuePlugin extends Plugin {
 		this.renderViews();
 	}
 
-	async resetTimer(path: string) {
-		delete this.data.timers[path]; // bewusst ohne Protokoll
+	async resetTimer(id: string) {
+		delete this.data.timers[id]; // bewusst ohne Protokoll
 		await this.save();
 		this.renderViews();
 	}
@@ -590,13 +767,13 @@ export default class FocusQueuePlugin extends Plugin {
 	}
 
 	async startFocus() {
-		if (!this.currentPath) {
-			new Notice("Die Queue ist leer – füge zuerst Tickets hinzu.");
+		if (!this.currentId) {
+			new Notice("Die Queue ist leer – füge zuerst Subtasks hinzu.");
 			await this.openQueue();
 			return;
 		}
-		if (this.cfg.autoStartTimer && !this.isRunning(this.currentPath)) {
-			await this.startTimerFor(this.currentPath);
+		if (this.cfg.autoStartTimer && !this.isRunning(this.currentId)) {
+			await this.startTimerFor(this.currentId);
 			await this.save();
 		}
 		await this.activate(VIEW_FOCUS, this.cfg.focusLocation);
@@ -636,19 +813,19 @@ export default class FocusQueuePlugin extends Plugin {
 
 	updateStatusBar() {
 		if (!this.statusEl) return;
-		const path = this.currentPath;
+		const id = this.currentId;
 		this.statusEl.empty();
-		if (!path) {
+		if (!id) {
 			this.statusEl.hide();
 			return;
 		}
 		this.statusEl.show();
-		const running = this.isRunning(path);
+		const running = this.isRunning(id);
 		this.statusEl.toggleClass("is-running", running);
 		setIcon(this.statusEl.createSpan({ cls: "fq-status-icon" }), running ? "timer" : "target");
-		let label = this.ticket(path)?.name ?? path.split("/").pop()!.replace(/\.md$/, "");
+		let label = this.itemTitle(id);
 		if (label.length > 40) label = label.slice(0, 39) + "…";
-		this.statusEl.createSpan({ text: ` ${label} · ${formatClock(this.getElapsed(path))}` });
+		this.statusEl.createSpan({ text: ` ${label} · ${formatClock(this.getElapsed(id))}` });
 		this.statusEl.setAttr("aria-label", "Fokus-Ansicht öffnen");
 	}
 
@@ -657,7 +834,7 @@ export default class FocusQueuePlugin extends Plugin {
 		if (file instanceof TFile) this.app.workspace.getLeaf("tab").openFile(file);
 	}
 
-	/** Kleine Infozeile: Kunde/Projekt · Jira-Status · fällig */
+	/** Kleine Infozeile: Kunde/Projekt · fällig */
 	metaParts(t: Ticket): string[] {
 		const parts: string[] = [];
 		const kp = [t.kunde, t.projekt].filter(Boolean).join(" / ");
@@ -678,10 +855,10 @@ export function statusTone(status: string): string {
 }
 
 /** Gut sichtbarer Status-Chip: Jira-Status, sonst lokaler Status. */
-function statusChip(el: HTMLElement, t: Ticket) {
+function statusChip(el: HTMLElement, t: Ticket, small = false) {
 	const label = t.jiraStatus || t.status;
 	if (!label) return;
-	const chip = el.createSpan({ cls: `fq-chip fq-tone-${statusTone(label)}`, text: label });
+	const chip = el.createSpan({ cls: `fq-chip fq-tone-${statusTone(label)}${small ? " is-small" : ""}`, text: label });
 	chip.setAttr("aria-label", t.jiraStatus ? `Jira-Status: ${t.jiraStatus}` : `Status: ${t.status}`);
 }
 
@@ -738,13 +915,20 @@ class QueueView extends ItemView {
 		root.createEl("h4", { cls: "fq-section", text: `Queue (${q.length})` });
 		const list = root.createEl("ol", { cls: "fq-list fq-queue" });
 		if (q.length === 0) {
-			const empty = list.createEl("li", { cls: "fq-empty", text: "Noch leer. Füge unten Tickets mit + hinzu oder ziehe sie hierher." });
+			const empty = list.createEl("li", {
+				cls: "fq-empty",
+				text: "Noch leer. Füge unten Subtasks mit + hinzu oder ziehe sie hierher.",
+			});
 			this.dropTarget(empty, () => 0);
 		}
-		q.forEach((path, i) => this.renderQueueItem(list, path, i));
+		q.forEach((id, i) => this.renderQueueItem(list, id, i));
 
-		root.createEl("h4", { cls: "fq-section", text: "Offene Tickets" });
-		const search = root.createEl("input", { type: "search", placeholder: "Suchen (Key, Titel, Kunde) …", cls: "fq-input fq-search" });
+		root.createEl("h4", { cls: "fq-section", text: "Offene Subtasks" });
+		const search = root.createEl("input", {
+			type: "search",
+			placeholder: "Suchen (Key, Titel, Kunde, Subtask) …",
+			cls: "fq-input fq-search",
+		});
 		search.value = this.search;
 		search.addEventListener("input", () => {
 			this.search = search.value;
@@ -755,13 +939,14 @@ class QueueView extends ItemView {
 		if (searchHadFocus) search.focus();
 	}
 
-	private renderTicketBody(parent: HTMLElement, path: string) {
+	/** Ticketzeile: Name (öffnet Notiz) + Jira-Status-Chip, darunter Prio und Infos. */
+	private renderTicketHeader(parent: HTMLElement, path: string, cls = "fq-body") {
 		const p = this.plugin;
 		const t = p.ticket(path);
-		const body = parent.createDiv("fq-body");
+		const body = parent.createDiv(cls);
 		const row = body.createDiv({ cls: "fq-title-row" });
 		const title = row.createDiv({ cls: "fq-title" });
-		title.createSpan({ text: t?.name ?? path.split("/").pop()!.replace(/\.md$/, "") });
+		title.createSpan({ text: p.ticketName(path) });
 		title.onclick = () => p.openNote(path);
 		if (t) statusChip(row, t);
 		const meta = body.createDiv("fq-meta");
@@ -773,19 +958,36 @@ class QueueView extends ItemView {
 		return meta;
 	}
 
-	private renderQueueItem(list: HTMLElement, path: string, i: number) {
+	/** Subtask in der Queue: Subtask-Text, darunter Ticket mit Status und Prio. */
+	private renderSubtaskBody(parent: HTMLElement, path: string, sub: string) {
 		const p = this.plugin;
+		const t = p.ticket(path);
+		const body = parent.createDiv("fq-body");
+		body.createDiv({ cls: "fq-subtask-text", text: sub });
+		const meta = body.createDiv("fq-meta");
+		if (t) {
+			statusChip(meta, t, true);
+			prioBadge(meta, t.prio);
+		}
+		const src = meta.createSpan({ cls: "fq-info fq-src", text: p.ticketName(path) });
+		src.onclick = () => p.openNote(path);
+		return meta;
+	}
+
+	private renderQueueItem(list: HTMLElement, id: string, i: number) {
+		const p = this.plugin;
+		const { path, sub } = p.item(id);
 		const li = list.createEl("li", { cls: "fq-item" });
 		if (i === 0) li.addClass("is-current");
-		if (p.isRunning(path)) li.addClass("is-running");
+		if (p.isRunning(id)) li.addClass("is-running");
 		li.draggable = true;
 
 		setIcon(li.createDiv("fq-handle"), "grip-vertical");
 		li.createDiv({ cls: "fq-num", text: String(i + 1) });
-		const meta = this.renderTicketBody(li, path);
+		const meta = sub === null ? this.renderTicketHeader(li, path) : this.renderSubtaskBody(li, path, sub);
 		const tEl = meta.createSpan({ cls: "fq-time" });
-		this.timerEls.set(path, tEl);
-		this.setTime(tEl, path);
+		this.timerEls.set(id, tEl);
+		this.setTime(tEl, id);
 
 		const actions = li.createDiv("fq-actions");
 		const btn = (icon: string, label: string, fn: () => void) => {
@@ -798,13 +1000,13 @@ class QueueView extends ItemView {
 		};
 		btn("arrow-up", "Nach oben", () => p.moveInQueue(i, i - 1));
 		btn("arrow-down", "Nach unten", () => p.moveInQueue(i, i + 1));
-		btn("x", "Aus Queue entfernen", () => p.removeFromQueue(path));
+		btn("x", "Aus Queue entfernen", () => p.removeFromQueue(id));
 
 		li.addEventListener("dragstart", (e) => {
 			this.dragFrom = i;
 			this.dragAdd = null;
 			li.addClass("is-dragging");
-			e.dataTransfer?.setData("text/plain", path);
+			e.dataTransfer?.setData("text/plain", id);
 			if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
 		});
 		li.addEventListener("dragend", () => {
@@ -832,9 +1034,9 @@ class QueueView extends ItemView {
 			let to = indexFor(isAfter(e));
 			this.clearDropMarks();
 			if (this.dragAdd) {
-				const path = this.dragAdd;
+				const id = this.dragAdd;
 				this.dragAdd = null;
-				this.plugin.addToQueue(path, to);
+				this.plugin.addToQueue(id, to);
 			} else if (this.dragFrom !== null) {
 				const from = this.dragFrom;
 				this.dragFrom = null;
@@ -848,48 +1050,70 @@ class QueueView extends ItemView {
 		this.contentEl.querySelectorAll(".drop-above, .drop-below").forEach((n) => n.removeClass("drop-above", "drop-below"));
 	}
 
+	/** Auswahl: je Ticket eine Gruppe (Status + Prio), darunter die offenen Subtasks. */
 	private renderAvailable() {
 		const p = this.plugin;
 		const el = this.availableEl;
 		el.empty();
 		const needle = this.search.trim().toLowerCase();
-		const tickets = p
+		const groups = p
 			.availableTickets()
-			.filter((t) => !needle || [t.name, t.kunde, t.projekt, t.key].join(" ").toLowerCase().includes(needle));
-		if (tickets.length === 0) {
-			el.createDiv({ cls: "fq-empty", text: needle ? "Keine Treffer." : "Keine weiteren offenen Tickets." });
+			.map((t) => {
+				const ticketHit = !needle || [t.name, t.kunde, t.projekt, t.key].join(" ").toLowerCase().includes(needle);
+				const items = p.availableItems(t).filter((it) => ticketHit || (it.sub ?? "").toLowerCase().includes(needle));
+				return { t, items };
+			})
+			.filter((g) => g.items.length > 0);
+		if (groups.length === 0) {
+			el.createDiv({ cls: "fq-empty", text: needle ? "Keine Treffer." : "Keine weiteren offenen Subtasks." });
 			return;
 		}
-		const list = el.createEl("ul", { cls: "fq-list fq-available" });
-		for (const t of tickets) {
-			const li = list.createEl("li", { cls: "fq-item fq-avail" });
-			li.draggable = true;
-			const plus = li.createDiv({ cls: "clickable-icon fq-add", attr: { "aria-label": "Zur Queue hinzufügen" } });
-			setIcon(plus, "plus");
-			plus.onclick = () => p.addToQueue(t.path);
-			this.renderTicketBody(li, t.path);
-			li.addEventListener("dblclick", () => p.addToQueue(t.path));
-			li.addEventListener("dragstart", (e) => {
-				this.dragAdd = t.path;
-				this.dragFrom = null;
-				e.dataTransfer?.setData("text/plain", t.path);
-				if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
-			});
-			li.addEventListener("dragend", () => {
-				this.dragAdd = null;
-				this.clearDropMarks();
-			});
+		for (const { t, items } of groups) {
+			const group = el.createDiv("fq-ticket-group");
+			const head = group.createDiv("fq-ticket-head");
+			this.renderTicketHeader(head, t.path);
+			if (items.length > 1) {
+				const all = head.createDiv({ cls: "clickable-icon fq-add", attr: { "aria-label": "Alle Subtasks zur Queue hinzufügen" } });
+				setIcon(all, "list-plus");
+				all.onclick = () => p.addTicketToQueue(t.path);
+			}
+			const list = group.createEl("ul", { cls: "fq-list fq-available" });
+			for (const it of items) this.renderAvailableItem(list, it);
 		}
 	}
 
-	private setTime(el: HTMLElement, path: string) {
-		const ms = this.plugin.getElapsed(path);
-		const running = this.plugin.isRunning(path);
+	private renderAvailableItem(list: HTMLElement, it: QueueItem) {
+		const p = this.plugin;
+		const li = list.createEl("li", { cls: "fq-item fq-avail fq-subtask" });
+		li.draggable = true;
+		const plus = li.createDiv({ cls: "clickable-icon fq-add", attr: { "aria-label": "Zur Queue hinzufügen" } });
+		setIcon(plus, "plus");
+		plus.onclick = () => p.addToQueue(it.id);
+		li.createDiv({
+			cls: "fq-body fq-subtask-text" + (it.sub === null ? " is-whole-ticket" : ""),
+			text: it.sub ?? "Ganzes Ticket (keine Subtasks)",
+		});
+		li.addEventListener("dblclick", () => p.addToQueue(it.id));
+		li.addEventListener("dragstart", (e) => {
+			this.dragAdd = it.id;
+			this.dragFrom = null;
+			e.dataTransfer?.setData("text/plain", it.id);
+			if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+		});
+		li.addEventListener("dragend", () => {
+			this.dragAdd = null;
+			this.clearDropMarks();
+		});
+	}
+
+	private setTime(el: HTMLElement, id: string) {
+		const ms = this.plugin.getElapsed(id);
+		const running = this.plugin.isRunning(id);
 		el.setText(ms > 0 || running ? `${running ? "▶ " : ""}${formatClock(ms)}` : "");
 	}
 
 	updateTimers() {
-		for (const [path, el] of this.timerEls) if (this.plugin.isRunning(path)) this.setTime(el, path);
+		for (const [id, el] of this.timerEls) if (this.plugin.isRunning(id)) this.setTime(el, id);
 	}
 }
 
@@ -924,9 +1148,9 @@ class FocusView extends ItemView {
 		this.timerEl = null;
 
 		const wrap = root.createDiv("fq-focus");
-		const path = p.currentPath;
+		const id = p.currentId;
 
-		if (!path) {
+		if (!id) {
 			wrap.createDiv({ cls: "fq-done-big", text: "🎉" });
 			wrap.createEl("h2", { text: "Alles erledigt" });
 			this.renderToday(wrap);
@@ -934,19 +1158,27 @@ class FocusView extends ItemView {
 			b.onclick = () => p.openQueue();
 			return;
 		}
+		const { path, sub } = p.item(id);
 		const t = p.ticket(path);
-		const name = t?.name ?? path.split("/").pop()!.replace(/\.md$/, "");
 
-		wrap.createDiv({ cls: "fq-label", text: "Aktueller Task" });
-		const title = wrap.createDiv({ cls: "fq-focus-task", text: name });
+		wrap.createDiv({ cls: "fq-label", text: sub !== null ? "Aktueller Subtask" : "Aktuelles Ticket" });
+		const title = wrap.createDiv({ cls: "fq-focus-task", text: p.itemTitle(id) });
 		title.onclick = () => p.openNote(path);
+		if (sub !== null) {
+			const tn = wrap.createDiv({ cls: "fq-focus-ticket", text: p.ticketName(path) });
+			tn.onclick = () => p.openNote(path);
+		}
 
-		const sub = wrap.createDiv("fq-focus-src");
+		const meta = wrap.createDiv("fq-focus-src");
 		if (t) {
-			statusChip(sub, t);
-			prioBadge(sub, t.prio);
+			statusChip(meta, t);
+			prioBadge(meta, t.prio);
 			const parts = p.metaParts(t);
-			if (parts.length) sub.createSpan({ text: parts.join(" · ") });
+			if (parts.length) meta.createSpan({ text: parts.join(" · ") });
+			if (sub !== null && t.subtasks.length) {
+				const done = t.subtasks.filter((s) => s.done).length;
+				meta.createSpan({ cls: "fq-progress", text: `Subtasks ${done}/${t.subtasks.length}` });
+			}
 		}
 		const links = wrap.createDiv("fq-focus-links");
 		const open = links.createEl("button", { cls: "fq-link" });
@@ -960,7 +1192,7 @@ class FocusView extends ItemView {
 			jira.onclick = () => window.open(t.link, "_blank");
 		}
 
-		const running = p.isRunning(path);
+		const running = p.isRunning(id);
 		this.timerEl = wrap.createDiv({ cls: "fq-clock" + (running ? " is-running" : "") });
 		this.updateTimer();
 
@@ -983,7 +1215,7 @@ class FocusView extends ItemView {
 			a.onclick = fn;
 		};
 		link("Überspringen", () => p.skipCurrent(), p.data.queue.length < 2);
-		link("Timer zurücksetzen", () => p.resetTimer(path));
+		link("Timer zurücksetzen", () => p.resetTimer(id));
 		link("Queue bearbeiten", () => p.openQueue());
 
 		this.renderToday(wrap);
@@ -994,14 +1226,14 @@ class FocusView extends ItemView {
 		if (t.date !== todayStr() || t.count === 0) return;
 		wrap.createDiv({
 			cls: "fq-today",
-			text: `Heute erledigt: ${t.count} Ticket${t.count === 1 ? "" : "s"}${t.ms > 0 ? ` · ${formatDuration(t.ms)}` : ""}`,
+			text: `Heute erledigt: ${t.count}${t.ms > 0 ? ` · ${formatDuration(t.ms)}` : ""}`,
 		});
 	}
 
 	updateTimer() {
-		const path = this.plugin.currentPath;
-		if (!this.timerEl || !path) return;
-		this.timerEl.setText(formatClock(this.plugin.getElapsed(path)));
+		const id = this.plugin.currentId;
+		if (!this.timerEl || !id) return;
+		this.timerEl.setText(formatClock(this.plugin.getElapsed(id)));
 	}
 }
 
@@ -1047,10 +1279,19 @@ class FocusQueueSettingTab extends PluginSettingTab {
 			);
 		new Setting(containerEl)
 			.setName("Ausgeblendete Status")
-			.setDesc("Tickets mit diesen Status erscheinen nicht in der Auswahl (kommagetrennt), z. B. „erledigt, wartet“.")
+			.setDesc("Tickets mit diesen Status (und ihre Subtasks) erscheinen nicht in der Auswahl (kommagetrennt), z. B. „erledigt, wartet“.")
 			.addText((t) =>
 				t.setValue(s.hiddenStatuses).onChange(async (v) => {
 					s.hiddenStatuses = v;
+					await saveRefresh();
+				}),
+			);
+		new Setting(containerEl)
+			.setName("Abschnitt mit Subtasks")
+			.setDesc("Checkboxen unter dieser Überschrift erscheinen als auswählbare Subtasks. Tickets ohne offene Subtasks lassen sich als Ganzes auswählen.")
+			.addText((t) =>
+				t.setValue(s.subtaskHeading).onChange(async (v) => {
+					s.subtaskHeading = v.trim() || DEFAULT_SETTINGS.subtaskHeading;
 					await saveRefresh();
 				}),
 			);
